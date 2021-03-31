@@ -24,31 +24,32 @@ extern crate embedded_hal;
 
 use constants::{ATECC608A_EXECUTION_TIME, EXECUTION_TIME};
 use macros::ConvertTo; // macro_rules macro that implements the 'ConvertTo trait'
+/*
+macro_rules! info {
+    ($x:expr) => {
+        ()
+    };
+}
+
+macro_rules! error {
+    ($x:expr) => {
+        ()
+    };
+}
+*/
 
 // proc-macro that implements the 'ConvertTo trait'
 // proc-macro syntax is a little more intuitive but you can use either of them (i.e. macro_rules impl or proc-macro impl)
 // use convertto_proc_macro::ConvertTo;
 // ConvertTo!([u8; 3], [u8; 4], [u8; 32], [u8; 64]);
 
-use core::fmt::Debug;
+
 use core::ops::Deref;
 use embedded_hal::blocking::delay::{DelayMs, DelayUs};
 use embedded_hal::blocking::i2c::{Read, Write};
 use embedded_hal::timer::CountDown;
 use heapless::{consts::*, Vec};
 use postcard::to_vec;
-
-// For logging i.e. printf style debugging
-use core::sync::atomic::{AtomicUsize, Ordering};
-
-#[defmt::timestamp]
-fn timestamp() -> u64 {
-    static COUNT: AtomicUsize = AtomicUsize::new(0);
-    // NOTE(no-CAS) `timestamps` run with interrupts disabled
-    let n = COUNT.load(Ordering::Relaxed);
-    COUNT.store(n + 1, Ordering::Relaxed);
-    n as u64
-}
 
 // use cortex_m_semihosting::hprintln;
 
@@ -82,7 +83,6 @@ pub struct ATECC608A<I2C, DELAY, TIMER> {
 impl<I2C, DELAY, TIMER, E> ATECC608A<I2C, DELAY, TIMER>
 where
     I2C: Read<Error = E> + Write<Error = E>,
-    E: Debug,
     DELAY: DelayMs<u32> + DelayUs<u32>,
     TIMER: CountDown<Time = u32>,
 {
@@ -101,26 +101,29 @@ where
     /// This method just writes a zero byte to the bus without reading data back.
     /// Its required in the 'wake-up routine'.
     /// Note - the sendpacket method is used wake the device properly.
-    pub fn wake(&mut self) -> Result<(), E> {
+    pub fn wake(&mut self) -> Result<(), constants::StatusError> {
         let wake_bytes = [0; 1];
         self.i2c.write(self.dev_addr, &wake_bytes)
+            .map_err(|_| constants::StatusError(constants::ATCA_MISC_ERROR))
     }
 
     /// This method just writes a `byte 0x02` to the bus and puts the device
     /// into idle mode. In idle mode, all subsequent I/O transitions are ignored
     /// until the next wake flag. The contents of TempKey and RNG Seed registers are
     /// retained.
-    pub fn idle(&mut self) -> Result<(), E> {
+    pub fn idle(&mut self) -> Result<(), constants::StatusError> {
         let idle_byte = [2];
         self.i2c.write(self.dev_addr, &idle_byte)
+            .map_err(|_| constants::StatusError(constants::ATCA_MISC_ERROR))
     }
 
     /// This method just writes a `byte 0x01` to the bus which sends the device
     /// into the low power or sleep mode and ignores all subsequent I/O
     /// transitions until the next wake flag. The entire volatile state of the device is reset.
-    pub fn sleep(&mut self) -> Result<(), E> {
+    pub fn sleep(&mut self) -> Result<(), constants::StatusError> {
         let sleep_byte = [1];
         self.i2c.write(self.dev_addr, &sleep_byte)
+            .map_err(|_| constants::StatusError(constants::ATCA_MISC_ERROR))
     }
 
     /// A method for sending commands to the ATECC608A and
@@ -145,16 +148,13 @@ where
         // The 'byte' is never
         // transmitted as the address always gets NACK'd.
         // This call holds SDA low for a period of at least 60 us.
-        match self.wake() {
-            Ok(v) => v,
-            Err(_e) => defmt::info!("DEVICE WAKE SEQUENCE: tWLO COMPLETE"),
-        };
+        self.wake()?;
         // Part 2 of 'wake sequence'
         // Upon receiving a NACK, the master releases SDA i.e. it gets pushed back up
         // tWHI - ADD a delay of at least 1500 us to ensure SDA is held high.
         // This sequence wakes the device ans is now ready for data exchange.
         self.delay.delay_us(WAKE_DELAY);
-        // defmt::info!("DEVICE WAKE SEQUENCE: tWHI COMPLETE");
+        // info!("DEVICE WAKE SEQUENCE: tWHI COMPLETE");
         // After waking the device, we can send our actual data packet
         // if packet[(constants::ATCA_COUNT_IDX + 1) as usize] == constants::ATCA_CMD_SIZE_MIN {
         //     self.i2c.write(self.dev_addr, &packet[..packet.len()]);
@@ -176,12 +176,8 @@ where
             pkt[idx] = *val;
         }
 
-        match self.i2c.write(self.dev_addr, &pkt[..(pkt[1] + 1) as usize]) {
-            Ok(v) => v,
-            Err(_e) => {
-                defmt::error!("I2C WRITE ERROR: failed to write command-packet to the device ")
-            }
-        };
+        self.i2c.write(self.dev_addr, &pkt[..(pkt[1] + 1) as usize])
+            .map_err(|_| constants::StatusError(constants::ATCA_MISC_ERROR))?;
 
         let t_exec: constants::Time = (EXECUTION_TIME::ATECC608A(texec.clone()))
             .get_value()
@@ -191,25 +187,19 @@ where
         // result can be read from the device using a normal read sequence.
         self.timer.start(t_exec.0 as u32 * 1000);
         block!(self.timer.wait())
-            .expect("ERROR: Something went wrong while waiting on the countdown timer to expire");
+            .map_err(|_| constants::StatusError(constants::ATCA_MISC_ERROR))?;
 
         // The first byte holds the length of the response.
         let mut count_byte = [0; 1];
-        match self.i2c.read(self.dev_addr, &mut count_byte){
-            Ok(v)   => v,
-            Err(_e)  => defmt::error!("I2C READ ERROR: failed to read the first (or count) byte of the response from the device")
-        };
+        self.i2c.read(self.dev_addr, &mut count_byte)
+            .map_err(|_| constants::StatusError(constants::ATCA_MISC_ERROR))?;
+
         // Perform a subsequent read for the remaining (response) bytes
         let mut resp = [0; (constants::ATCA_CMD_SIZE_MAX) as usize];
-        match self
+        self
             .i2c
             .read(self.dev_addr, &mut resp[..(count_byte[0] - 1) as usize])
-        {
-            Ok(v) => v,
-            Err(_e) => defmt::error!(
-                "I2C READ ERROR: failed to read the remainder of the response from the device"
-            ),
-        };
+            .map_err(|_| constants::StatusError(constants::ATCA_MISC_ERROR))?;
 
         // // Retry if its a CRC or Other Communications error. We could end up in a loop here
         // // Enable, if you'd like retry,
@@ -234,10 +224,7 @@ where
             } else if resp[(constants::ATCA_RSP_DATA_IDX - 1) as usize]
                 == constants::ATCA_WATCHDOG_ABOUT_TO_EXPIRE
             {
-                match self.sleep() {
-                    Ok(v) => v,
-                    Err(_e) => defmt::error!("I2C WRITE ERROR: failed to put the device to sleep"),
-                };
+                self.sleep()?;
 
                 status_error = constants::DECODE_ERROR::get_error(
                     resp[(constants::ATCA_RSP_DATA_IDX - 1) as usize],
@@ -304,15 +291,12 @@ where
     /// -   4-byte revision info [00 00 60 vv] indicated by ATECC608A. vv is the most recent silicon version.
     pub fn atcab_info(
         &mut self,
-    ) -> Result<[u8; (constants::INFO_RSP_SIZE - 3) as usize], &'static str> {
+    ) -> Result<[u8; (constants::INFO_RSP_SIZE - 3) as usize], constants::StatusError> {
         let packet = self.atcab_info_base(constants::INFO_MODE_REVISION);
-        let response = match self.send_packet(
+        let response = self.send_packet(
             packet.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_INFO(constants::ATCA_INFO),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(response.convert_to_4())
     }
 
@@ -405,17 +389,14 @@ where
     pub fn atcab_sha(
         &mut self,
         data: &[u8],
-    ) -> Result<[u8; (constants::SHA_RSP_SIZE - 3) as usize], &'static str> {
+    ) -> Result<[u8; (constants::SHA_RSP_SIZE - 3) as usize], constants::StatusError> {
         let bs = constants::ATCA_SHA256_BLOCK_SIZE;
         // Initialize SHA 256 engine
         let packet = self.atcab_sha_base(constants::SHA_MODE_SHA256_START, &[]);
-        let _sha_init_resp = match self.send_packet(
+        let _sha_init_resp = self.send_packet(
             packet.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_SHA(constants::ATCA_SHA),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
 
         let mut remaining = data.len() as usize;
         let n: usize = bs as usize; //or 0x40 - sha256 takes a 512-bit block of data or 64 bytes at a time.
@@ -427,13 +408,10 @@ where
             let bytes = &data[counter..n];
             // Update SHA 256 state with consecutive blocks of 64 bytes.
             let packet_update = self.atcab_sha_base(constants::SHA_MODE_SHA256_UPDATE, bytes);
-            let _sha_update_resp = match self.send_packet(
+            let _sha_update_resp = self.send_packet(
                 packet_update.deref(),
                 ATECC608A_EXECUTION_TIME::ATCA_SHA(constants::ATCA_SHA),
-            ) {
-                Ok(v) => v,
-                Err(e) => return Err(e.1.get_string_error()),
-            };
+            )?;
             remaining -= n;
             counter += n;
         }
@@ -442,13 +420,10 @@ where
             constants::SHA_MODE_SHA256_END,
             &data[counter..counter + remaining],
         );
-        let sha_final_resp = match self.send_packet(
+        let sha_final_resp = self.send_packet(
             packet_final.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_SHA(constants::ATCA_SHA),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(sha_final_resp.convert_to_32())
     }
 
@@ -519,15 +494,12 @@ where
     /// Returns:
     /// -   a 64 byte array containing public keys X and Y coordinates, indicating the command’s success
     /// -   or an error string, describing the error.
-    pub fn atcab_genkey(&mut self, key_id: u16) -> Result<[u8; 64], &'static str> {
+    pub fn atcab_genkey(&mut self, key_id: u16) -> Result<[u8; 64], constants::StatusError> {
         let packet = self.atcab_genkey_base(constants::GENKEY_MODE_PRIVATE as u16, key_id, [0; 3]);
-        let genkey_resp = match self.send_packet(
+        let genkey_resp = self.send_packet(
             packet.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_GENKEY(constants::ATCA_GENKEY),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(genkey_resp.convert_to_64())
     }
 
@@ -541,15 +513,12 @@ where
     /// Returns:
     /// -   a 64 byte array containing public keys X and Y coordinates, indicating the command’s success
     /// -   or an error string, describing the error.
-    pub fn atcab_get_pubkey(&mut self, key_id: u16) -> Result<[u8; 64], &'static str> {
+    pub fn atcab_get_pubkey(&mut self, key_id: u16) -> Result<[u8; 64], constants::StatusError> {
         let packet = self.atcab_genkey_base(constants::GENKEY_MODE_PUBLIC as u16, key_id, [0; 3]);
-        let genkey_resp = match self.send_packet(
+        let genkey_resp = self.send_packet(
             packet.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_GENKEY(constants::ATCA_GENKEY),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(genkey_resp.convert_to_64())
     }
 
@@ -570,14 +539,14 @@ where
     ///
     /// Returns:
     /// -   A heapless Vec containing the serialized command packet bytes.
-    pub fn atcab_base_nonce(&mut self, mode: u16, zero: u16, num_in: &[u8]) -> Vec<u8, U74> {
+    pub fn atcab_base_nonce(&mut self, mode: u16, zero: u16, num_in: &[u8]) -> Result<Vec<u8, U74>, constants::StatusError> {
         let nonce_mode = mode & constants::NONCE_MODE_MASK as u16;
         if nonce_mode == constants::NONCE_MODE_SEED_UPDATE as u16
             || nonce_mode == constants::NONCE_MODE_NO_SEED_UPDATE as u16
             || nonce_mode == constants::NONCE_MODE_PASSTHROUGH as u16
         {
         } else {
-            defmt::error!("Not a valid NONCE command (or mode): ");
+            return Err(constants::StatusError(constants::ATCA_MISC_ERROR));
         }
 
         let mut txsize = 0;
@@ -595,7 +564,7 @@ where
         }
 
         if num_in.len() < (txsize - constants::ATCA_CMD_SIZE_MIN as u16) as usize {
-            defmt::error!("Nonce generation failed. Invalid number of input-bytes provided")
+            return Err(constants::StatusError(constants::ATCA_MISC_ERROR));
         }
 
         let mut q = packet::ATCAPacket_w_data {
@@ -618,7 +587,7 @@ where
         //  Serialize packet structure to get a Heapless Vec. The Vec's size still needs to
         // be known at compile time.
         let output: Vec<u8, U74> = to_vec(packet).unwrap();
-        return output;
+        Ok(output)
     }
 
     /// This method passes a fixed nonce (num_in) to the device and stores it in the Message Digest Buffer.
@@ -637,7 +606,7 @@ where
         &mut self,
         target: u16,
         num_in: &[u8],
-    ) -> Result<[u8; (constants::WRITE_RSP_SIZE - 1) as usize], &'static str> {
+    ) -> Result<[u8; (constants::WRITE_RSP_SIZE - 1) as usize], constants::StatusError> {
         let mut mode = constants::NONCE_MODE_PASSTHROUGH;
         // Target - where to load the fixed nonce - TEMPKEY or Message Digest Buffer
         mode = mode | (constants::NONCE_MODE_TARGET_MASK & target as u8);
@@ -647,17 +616,14 @@ where
         } else if num_in.len() == 64 {
             mode = mode | constants::NONCE_MODE_INPUT_LEN_64;
         } else {
-            defmt::error!("Nonce generation failed. Invalid number of input-bytes provided")
+            return Err(constants::StatusError(constants::ATCA_MISC_ERROR));
         }
 
-        let packet = self.atcab_base_nonce(mode as u16, 0, num_in);
-        let nonce_load_resp = match self.send_packet(
+        let packet = self.atcab_base_nonce(mode as u16, 0, num_in)?;
+        let nonce_load_resp = self.send_packet(
             packet.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_NONCE(constants::ATCA_NONCE),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(nonce_load_resp.convert_to_3())
     }
 
@@ -680,15 +646,12 @@ where
     pub fn atcab_nonce(
         &mut self,
         num_in: &[u8],
-    ) -> Result<[u8; (constants::WRITE_RSP_SIZE - 1) as usize], &'static str> {
-        let packet = self.atcab_base_nonce(constants::NONCE_MODE_PASSTHROUGH as u16, 0, num_in);
-        let nonce_load_resp = match self.send_packet(
+    ) -> Result<[u8; (constants::WRITE_RSP_SIZE - 1) as usize], constants::StatusError> {
+        let packet = self.atcab_base_nonce(constants::NONCE_MODE_PASSTHROUGH as u16, 0, num_in)?;
+        let nonce_load_resp = self.send_packet(
             packet.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_NONCE(constants::ATCA_NONCE),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(nonce_load_resp.convert_to_3())
     }
 
@@ -696,15 +659,12 @@ where
     pub fn atcab_challenge(
         &mut self,
         num_in: &[u8],
-    ) -> Result<[u8; (constants::WRITE_RSP_SIZE - 1) as usize], &'static str> {
-        let packet = self.atcab_base_nonce(constants::NONCE_MODE_PASSTHROUGH as u16, 0, num_in);
-        let nonce_load_resp = match self.send_packet(
+    ) -> Result<[u8; (constants::WRITE_RSP_SIZE - 1) as usize], constants::StatusError> {
+        let packet = self.atcab_base_nonce(constants::NONCE_MODE_PASSTHROUGH as u16, 0, num_in)?;
+        let nonce_load_resp = self.send_packet(
             packet.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_NONCE(constants::ATCA_NONCE),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(nonce_load_resp.convert_to_3())
     }
 
@@ -732,16 +692,13 @@ where
         &mut self,
         out_type: u16,
         num_in: &[u8],
-    ) -> Result<[u8; (constants::NONCE_RSP_SIZE_LONG - 3) as usize], &'static str> {
+    ) -> Result<[u8; (constants::NONCE_RSP_SIZE_LONG - 3) as usize], constants::StatusError> {
         let packet =
-            self.atcab_base_nonce(constants::NONCE_MODE_SEED_UPDATE as u16, out_type, num_in);
-        let nonce_load_resp = match self.send_packet(
+            self.atcab_base_nonce(constants::NONCE_MODE_SEED_UPDATE as u16, out_type, num_in)?;
+        let nonce_load_resp = self.send_packet(
             packet.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_NONCE(constants::ATCA_NONCE),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(nonce_load_resp.convert_to_32())
     }
 
@@ -751,15 +708,12 @@ where
     pub fn atcab_challenge_seed_update(
         &mut self,
         num_in: &[u8],
-    ) -> Result<[u8; (constants::NONCE_RSP_SIZE_LONG - 3) as usize], &'static str> {
-        let packet = self.atcab_base_nonce(constants::NONCE_MODE_SEED_UPDATE as u16, 0, num_in);
-        let nonce_load_resp = match self.send_packet(
+    ) -> Result<[u8; (constants::NONCE_RSP_SIZE_LONG - 3) as usize], constants::StatusError> {
+        let packet = self.atcab_base_nonce(constants::NONCE_MODE_SEED_UPDATE as u16, 0, num_in)?;
+        let nonce_load_resp = self.send_packet(
             packet.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_NONCE(constants::ATCA_NONCE),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(nonce_load_resp.convert_to_32())
     }
 
@@ -815,7 +769,7 @@ where
         &mut self,
         key_id: u16,
         digest: &[u8],
-    ) -> Result<[u8; (constants::SIGN_RSP_SIZE) as usize], &'static str> {
+    ) -> Result<[u8; (constants::SIGN_RSP_SIZE) as usize], constants::StatusError> {
         let mut nonce_target = constants::NONCE_MODE_TARGET_TEMPKEY;
         let mut sign_source = constants::SIGN_MODE_SOURCE_TEMPKEY;
 
@@ -824,18 +778,14 @@ where
             sign_source = constants::SIGN_MODE_SOURCE_MSGDIGBUF;
         }
         // Load digest into device's Message Digest Buffer. nonce_target determines the buffer location for the location.
-        self.atcab_nonce_load(nonce_target as u16, digest)
-            .expect("ERROR: loading fixed nonce: ");
+        self.atcab_nonce_load(nonce_target as u16, digest)?;
 
         let packet =
             self.atcab_sign_base((constants::SIGN_MODE_EXTERNAL | sign_source) as u16, key_id);
-        let ext_sign_resp = match self.send_packet(
+        let ext_sign_resp = self.send_packet(
             packet.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_SIGN(constants::ATCA_SIGN),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(ext_sign_resp.convert_to_64())
     }
 
@@ -863,7 +813,7 @@ where
         key_id: u16,
         is_invalidate: bool,
         is_full_sn: bool,
-    ) -> Result<[u8; (constants::SIGN_RSP_SIZE) as usize], &'static str> {
+    ) -> Result<[u8; (constants::SIGN_RSP_SIZE) as usize], constants::StatusError> {
         let mut mode = constants::SIGN_MODE_INTERNAL;
         if is_invalidate {
             mode = mode | constants::SIGN_MODE_INVALIDATE;
@@ -874,13 +824,10 @@ where
         }
 
         let packet = self.atcab_sign_base(mode as u16, key_id);
-        let int_sign_resp = match self.send_packet(
+        let int_sign_resp = self.send_packet(
             packet.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_SIGN(constants::ATCA_SIGN),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(int_sign_resp.convert_to_64())
     }
 
@@ -928,12 +875,12 @@ where
         public_key: &[u8],
         other_data: &[u8],
         _mac: &[u8],
-    ) -> Vec<u8, U151> {
+    ) -> Result<Vec<u8, U151>, constants::StatusError> {
         let verify_mode = mode & constants::VERIFY_MODE_MASK as u16;
 
         let verify_mode_external = constants::VERIFY_MODE_EXTERNAL;
         if (verify_mode == verify_mode_external as u16) && (public_key == &[]) {
-            defmt::error!("Invalid `public key` provided: ")
+            return Err(constants::StatusError(constants::ATCA_MISC_ERROR));
         }
 
         let verify_mode_validate = constants::VERIFY_MODE_VALIDATE;
@@ -942,8 +889,7 @@ where
             || (verify_mode == verify_mode_invalidate as u16))
             && (other_data == &[])
         {
-            defmt::error!("Invalid number of bytes provided for `validate or invalidate command` on chosen `public key` slot: 
-                     Please provide the same `19 bytes` that were used when calculating the original signature")
+            return Err(constants::StatusError(constants::ATCA_MISC_ERROR));
         }
 
         let mut txsize = 0;
@@ -1001,7 +947,7 @@ where
         //  Serialize packet structure to get a Heapless Vec. The Vec's size still needs to
         // be known at compile time.
         let output: Vec<u8, U151> = to_vec(packet).unwrap();
-        return output;
+        Ok(output)
     }
 
     /// The Verify command may be used to verify a message generated externally to the device with a
@@ -1024,7 +970,7 @@ where
         message: &[u8],
         signature: &[u8],
         pub_key: &[u8],
-    ) -> Result<[u8; (constants::VERIFY_RSP_SIZE - 1) as usize], &'static str> {
+    ) -> Result<[u8; (constants::VERIFY_RSP_SIZE - 1) as usize], constants::StatusError> {
         let mut nonce_target = constants::NONCE_MODE_TARGET_TEMPKEY;
         let mut verify_source = constants::VERIFY_MODE_SOURCE_TEMPKEY;
 
@@ -1033,8 +979,7 @@ where
             verify_source = constants::VERIFY_MODE_SOURCE_MSGDIGBUF; // source for verify
         }
         // Load digest into device's Message Digest Buffer. `nonce_target` setting determines the buffer location.
-        self.atcab_nonce_load(nonce_target as u16, message)
-            .expect("ERROR: loading fixed nonce: ");
+        self.atcab_nonce_load(nonce_target as u16, message)?;
 
         let packet = self.atcab_verify(
             (constants::VERIFY_MODE_EXTERNAL | verify_source) as u16,
@@ -1043,15 +988,12 @@ where
             pub_key,
             &[],
             &[],
-        );
+        )?;
 
-        let ext_verify_resp = match self.send_packet(
+        let ext_verify_resp = self.send_packet(
             packet.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_VERIFY(constants::ATCA_VERIFY),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(ext_verify_resp.convert_to_3())
     }
 
@@ -1072,7 +1014,7 @@ where
         message: &[u8],
         signature: &[u8],
         key_id: u16,
-    ) -> Result<[u8; (constants::VERIFY_RSP_SIZE - 1) as usize], &'static str> {
+    ) -> Result<[u8; (constants::VERIFY_RSP_SIZE - 1) as usize], constants::StatusError> {
         let mut nonce_target = constants::NONCE_MODE_TARGET_TEMPKEY;
         let mut verify_source = constants::VERIFY_MODE_SOURCE_TEMPKEY;
 
@@ -1081,8 +1023,7 @@ where
             verify_source = constants::VERIFY_MODE_SOURCE_MSGDIGBUF;
         }
         // Load digest into device's Message Digest Buffer. `nonce_target` setting determines the buffer location.
-        self.atcab_nonce_load(nonce_target as u16, message)
-            .expect("ERROR: loading fixed nonce: ");
+        self.atcab_nonce_load(nonce_target as u16, message)?;
 
         let packet = self.atcab_verify(
             (constants::VERIFY_MODE_STORED | verify_source) as u16,
@@ -1091,14 +1032,11 @@ where
             &[],
             &[],
             &[],
-        );
-        let ext_verify_resp = match self.send_packet(
+        )?;
+        let ext_verify_resp = self.send_packet(
             packet.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_VERIFY(constants::ATCA_VERIFY),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(ext_verify_resp.convert_to_3())
     }
 
@@ -1149,18 +1087,15 @@ where
     /// -   or an error string, describing the error.
     pub fn atcab_lock_config_zone(
         &mut self,
-    ) -> Result<[u8; (constants::LOCK_RSP_SIZE - 1) as usize], &'static str> {
+    ) -> Result<[u8; (constants::LOCK_RSP_SIZE - 1) as usize], constants::StatusError> {
         let packet = self.atcab_lock(
             constants::LOCK_ZONE_NO_CRC | constants::LOCK_ZONE_CONFIG,
             [0; 2],
         );
-        let lock_resp = match self.send_packet(
+        let lock_resp = self.send_packet(
             packet.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_LOCK(constants::ATCA_LOCK),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(lock_resp.convert_to_3())
     }
 
@@ -1185,15 +1120,12 @@ where
     pub fn atcab_lock_config_zone_crc(
         &mut self,
         crc: [u8; 2],
-    ) -> Result<[u8; (constants::LOCK_RSP_SIZE - 1) as usize], &'static str> {
+    ) -> Result<[u8; (constants::LOCK_RSP_SIZE - 1) as usize], constants::StatusError> {
         let packet = self.atcab_lock(constants::LOCK_ZONE_CONFIG, crc);
-        let lock_resp = match self.send_packet(
+        let lock_resp = self.send_packet(
             packet.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_LOCK(constants::ATCA_LOCK),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(lock_resp.convert_to_3())
     }
 
@@ -1255,10 +1187,10 @@ where
         if length == constants::ATCA_WORD_SIZE as u16 || length == constants::ATCA_BLOCK_SIZE as u16
         {
         } else {
-            defmt::error!("ERROR: reading memory zone, only 4 or 32 byte reads are allowed");
+            return Err(constants::StatusError(constants::ATCA_MISC_ERROR));
         }
 
-        let addr = self.atcab_get_addr(zone, slot, block, offset);
+        let addr = self.atcab_get_addr(zone, slot, block, offset)?;
 
         if length == constants::ATCA_BLOCK_SIZE as u16 {
             zone = zone | constants::ATCA_ZONE_READWRITE_32 as u16; // mode parameter for the read command
@@ -1314,11 +1246,11 @@ where
         _block: u16,
         offset: u16, // If you want start reading from an offset within a given memory zone
         length: u16, // the number of bytes to be retrieved.
-    ) -> Result<[[u8; 151]; 4], &'static str> {
-        let zone_size = self.atcab_get_zone_size(zone, slot);
+    ) -> Result<[[u8; 151]; 4], constants::StatusError> {
+        let zone_size = self.atcab_get_zone_size(zone, slot)?;
 
         if (offset + length) as u16 > zone_size {
-            defmt::error!("ERROR: number of bytes to read from offset > zone size");
+            return Err(constants::StatusError(constants::ATCA_MISC_ERROR));
         }
 
         let bs = constants::ATCA_BLOCK_SIZE as u16;
@@ -1341,11 +1273,7 @@ where
             }
             // craft a 32 or 4 byte read command packet, send it and store the response from the device
             // in an array of arrays buffer.
-            let packet = self.atcab_read_zone(zone, slot, block_count, word_count, read_size);
-            let read_resp = match packet {
-                Ok(v) => v,
-                Err(e) => return Err(e.1.get_string_error()),
-            };
+            let read_resp = self.atcab_read_zone(zone, slot, block_count, word_count, read_size)?;
 
             config_zone[i] = read_resp;
             i += 1;
@@ -1379,10 +1307,10 @@ where
     ///
     /// Returns
     /// -   a bool indicating `True` if the zone is locked.
-    pub fn atcab_is_locked(&mut self, zone: u16) -> bool {
+    pub fn atcab_is_locked(&mut self, zone: u16) -> Result<bool, constants::StatusError> {
         if zone == constants::LOCK_ZONE_CONFIG as u16 || zone == constants::LOCK_ZONE_DATA as u16 {
         } else {
-            defmt::error!("'isLocked' check failed. Not a valid zone ID: ");
+            return Err(constants::StatusError(constants::ATCA_MISC_ERROR));
         }
 
         let resp = match self.atcab_read_zone(
@@ -1396,11 +1324,11 @@ where
             Err(e) => panic!("ERROR: reading lock bytes [84] or [85]: {:?}", e),
         };
         if zone == constants::LOCK_ZONE_CONFIG as u16 && resp[3] != 0x55 {
-            return true;
+            return Ok(true);
         } else if zone == constants::LOCK_ZONE_DATA as u16 && resp[2] != 0x55 {
-            return true;
+            return Ok(true);
         } else {
-            return false;
+            return Ok(false);
         }
     }
 
@@ -1418,17 +1346,14 @@ where
     /// Returns
     /// -   An array containing 128 bytes i.e. contents of config zone
     /// -   or an error string describing the error.
-    pub fn atcab_read_config_zone(&mut self) -> Result<[u8; 128], &'static str> {
-        let packet = match self.atcab_read_bytes_zone(
+    pub fn atcab_read_config_zone(&mut self) -> Result<[u8; 128], constants::StatusError> {
+        let packet = self.atcab_read_bytes_zone(
             constants::ATCA_ZONE_CONFIG as u16,
             0,
             0,
             0,
             constants::ATCA_ECC_CONFIG_SIZE as u16,
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
+        )?;
         // We have a 128 byte config zone. Iterate over the 4 element 'array of arrays'.
         // chain contents (bytes) into a single 128 byte array.
         let slice_1 = &packet[0][..32];
@@ -1471,18 +1396,18 @@ where
     ///
     /// Returns:
     /// -   u16: Address of first word to be read/written within the zone  
-    pub fn atcab_get_addr(&mut self, zone: u16, slot: u16, block: u16, offset: u16) -> u16 {
+    pub fn atcab_get_addr(&mut self, zone: u16, slot: u16, block: u16, offset: u16) -> Result<u16, constants::StatusError> {
         let mem_zone = zone & constants::ATCA_ZONE_MASK as u16;
         if mem_zone == constants::ATCA_ZONE_CONFIG as u16
             || mem_zone == constants::ATCA_ZONE_DATA as u16
             || mem_zone == constants::ATCA_ZONE_OTP as u16
         {
         } else {
-            defmt::error!("ERROR: retrieving memory address");
+            return Err(constants::StatusError(constants::ATCA_MISC_ERROR));
         }
 
         if slot > 15 {
-            defmt::error!("ERROR: slot ID out of range")
+            return Err(constants::StatusError(constants::ATCA_MISC_ERROR));
         }
 
         let mut addr = 0;
@@ -1498,7 +1423,7 @@ where
             addr = addr | block << 8;
         }
 
-        return addr as u16;
+        Ok(addr as u16)
     }
 
     /// Method arguments:
@@ -1507,31 +1432,31 @@ where
     ///
     /// Returns:
     /// -   u16: Size of the zone
-    pub fn atcab_get_zone_size(&mut self, zone: u16, slot: u16) -> u16 {
+    pub fn atcab_get_zone_size(&mut self, zone: u16, slot: u16) -> Result<u16, constants::StatusError> {
         if zone == constants::ATCA_ZONE_CONFIG as u16
             || zone == constants::ATCA_ZONE_DATA as u16
             || zone == constants::ATCA_ZONE_OTP as u16
         {
         } else {
-            defmt::error!("ERROR: retrieving zone size");
+            return Err(constants::StatusError(constants::ATCA_MISC_ERROR));
         }
 
         if slot > 15 {
-            defmt::error!("ERROR: Slot ID out of range")
+            return Err(constants::StatusError(constants::ATCA_MISC_ERROR));
         }
 
         if zone == constants::ATCA_ZONE_CONFIG as u16 {
-            return 128;
+            return Ok(128);
         } else if zone == constants::ATCA_ZONE_OTP as u16 {
-            return 64;
+            return Ok(64);
         } else if zone == constants::ATCA_ZONE_DATA as u16 && slot < 8 {
-            return 36;
+            return Ok(36);
         } else if zone == constants::ATCA_ZONE_DATA as u16 && slot == 8 {
-            return 412;
+            return Ok(412);
         } else if zone == constants::ATCA_ZONE_DATA as u16 && slot < 16 {
-            return 72;
+            return Ok(72);
         } else {
-            return 0;
+            return Ok(0);
         }
     }
 
@@ -1567,7 +1492,7 @@ where
         address: u16,
         data: &[u8],
         mac: &[u8; 32],
-    ) -> Result<[u8; (constants::WRITE_RSP_SIZE - 1) as usize], &'static str> {
+    ) -> Result<[u8; (constants::WRITE_RSP_SIZE - 1) as usize], constants::StatusError> {
         let mut txsize = constants::ATCA_CMD_SIZE_MIN;
         let mut data_buffer = [0; 64];
         let payload;
@@ -1618,13 +1543,10 @@ where
         );
         let output: Vec<u8, U74> = to_vec(packet).unwrap();
 
-        let write_resp = match self.send_packet(
+        let write_resp = self.send_packet(
             output.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_WRITE(constants::ATCA_WRITE),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(write_resp.convert_to_3())
     }
 
@@ -1636,13 +1558,13 @@ where
         block: u16,
         offset: u16,
         data: &[u8],
-    ) -> Result<[u8; (constants::WRITE_RSP_SIZE - 1) as usize], &'static str> {
+    ) -> Result<[u8; (constants::WRITE_RSP_SIZE - 1) as usize], constants::StatusError> {
         let length = data.len();
         if (length == constants::ATCA_WORD_SIZE as usize)
             || (length == constants::ATCA_BLOCK_SIZE as usize)
         {
         } else {
-            defmt::error!("ERROR: Not 4 byte or a 32 byte write");
+            return Err(constants::StatusError(constants::ATCA_MISC_ERROR));
         }
 
         if length == constants::ATCA_BLOCK_SIZE as usize {
@@ -1650,11 +1572,8 @@ where
         } // the 7th bit needs to be '1' for 32 byte reads.
         let mac = [0; 32];
 
-        let addr = self.atcab_get_addr(zone, slot, block, offset);
-        let resp = match self.atcab_write(zone, addr, data, &mac) {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
+        let addr = self.atcab_get_addr(zone, slot, block, offset)?;
+        let resp = self.atcab_write(zone, addr, data, &mac)?;
         Ok(resp)
     }
 
@@ -1673,12 +1592,12 @@ where
         slot: u16,
         offset: u16,
         data: &[u8],
-    ) -> Vec<[u8; 3], U20> {
-        let zone_size = self.atcab_get_zone_size(zone, slot);
+    ) -> Result<Vec<[u8; 3], U20>, constants::StatusError> {
+        let zone_size = self.atcab_get_zone_size(zone, slot)?;
 
         let length = data.len();
         if offset + length as u16 > zone_size {
-            defmt::error!("ERROR: number of bytes to write from offset > zone size");
+            return Err(constants::StatusError(constants::ATCA_MISC_ERROR));
         }
 
         let bs = constants::ATCA_BLOCK_SIZE as u16;
@@ -1707,12 +1626,12 @@ where
                         block_count,
                         0x00,
                         &data[d_idx..d_idx + (bs as usize)],
-                    )
-                    .expect("32-byte write error: ");
+                    )?;
+                    
 
-                status_packets.push(resp).expect(
-                    "too many writes: {heapless vec is full}, hint: increment len(heapless vec)",
-                );
+                status_packets
+                    .push(resp)
+                    .map_err(|_| constants::StatusError(constants::ATCA_MISC_ERROR))?;
                 d_idx += bs as usize;
                 block_count += 1;
             } else {
@@ -1726,10 +1645,10 @@ where
                             block_count,
                             word_count,
                             &data[d_idx..d_idx + (ws as usize)],
-                        )
-                        .expect("4-byte write error: ");
-                    status_packets.push(resp)
-                                  .expect("too many writes: {heapless vec is full}, hint: increment len(heapless vec)");
+                        )?;
+                    status_packets
+                        .push(resp)
+                        .map_err(|_| constants::StatusError(constants::ATCA_MISC_ERROR))?;
                 }
 
                 d_idx += ws as usize;
@@ -1742,7 +1661,7 @@ where
             }
         }
         // hprintln!("status_packets : {:?}", status_packets).unwrap();
-        return status_packets;
+        Ok(status_packets)
     }
 
     /// Not implemented
@@ -1762,8 +1681,8 @@ where
     /// -   Byte 1      => 00 means success, anything else is an error.
     /// -   Byte 2-3    => checksum of 4 bytes i.e. CRC((length byte == 4) + byte 1). For a successful
     ///                  write, this is always == [0x03, 0x40]
-    pub fn atcab_write_config_zone(&mut self, config_data: &[u8]) -> [[u8; 3]; 15] {
-        let config_size = self.atcab_get_zone_size(constants::ATCA_ZONE_CONFIG as u16, 0);
+    pub fn atcab_write_config_zone(&mut self, config_data: &[u8]) -> Result<[[u8; 3]; 15], constants::StatusError> {
+        let config_size = self.atcab_get_zone_size(constants::ATCA_ZONE_CONFIG as u16, 0)?;
         let mut write_config_resp = [[0; 3]; 15];
         //Write config zone excluding UserExtra and UserExtraAdd
         let mut status_packets = self.atcab_write_bytes_zone(
@@ -1771,7 +1690,7 @@ where
             0x00,
             16,
             &config_data[16..config_size as usize],
-        );
+        )?;
 
         // Write the UserExtra and UserExtraAdd. This may fail if either value is already non-zero.
         let user_extra_packet = self.atcab_updateextra(
@@ -1779,21 +1698,22 @@ where
             config_data[84] as u16,
         );
         status_packets
-            .push(user_extra_packet.expect("ERROR: failed to write to UserExtra field: "))
-            .expect("too many writes: {heapless vec is full}, hint: increment len(heapless vec)");
+            .push(user_extra_packet?)
+            .map_err(|_| constants::StatusError(constants::ATCA_MISC_ERROR))?;
+
         let user_extra_add_packet = self.atcab_updateextra(
             constants::UPDATE_MODE_USER_EXTRA as u16,
             config_data[85] as u16,
         );
         status_packets
-            .push(user_extra_add_packet.expect("ERROR: failed to write to UserExtra field: "))
-            .expect("too many writes: {heapless vec is full}, hint: increment len(heapless vec)");
+            .push(user_extra_add_packet?)
+            .map_err(|_| constants::StatusError(constants::ATCA_MISC_ERROR))?;
 
         for (idx, val) in (status_packets.deref()).iter().enumerate() {
             write_config_resp[idx] = *val
         }
         // hprintln!("write_config_resp : {:?}", write_config_resp).unwrap();
-        return write_config_resp;
+        Ok(write_config_resp)
     }
 
     /// Not implemented
@@ -1821,7 +1741,7 @@ where
         &mut self,
         mode: u16,
         value: u16,
-    ) -> Result<[u8; (constants::UPDATE_RSP_SIZE - 1) as usize], &'static str> {
+    ) -> Result<[u8; (constants::UPDATE_RSP_SIZE - 1) as usize], constants::StatusError> {
         let mut q = packet::ATCAPacket {
             pkt_id: 0x03,
             txsize: 0,
@@ -1841,13 +1761,10 @@ where
         //  Serialize packet structure to get a Heapless Vec.
         let output: Vec<u8, U10> = to_vec(packet).unwrap();
 
-        let update_extra_rsp = match self.send_packet(
+        let update_extra_rsp = self.send_packet(
             output.deref(),
             ATECC608A_EXECUTION_TIME::ATCA_UPDATE_EXTRA(constants::ATCA_UPDATE_EXTRA),
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(e.1.get_string_error()),
-        };
+        )?;
         Ok(update_extra_rsp.convert_to_3())
     }
 }

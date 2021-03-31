@@ -560,25 +560,28 @@ pub(crate) const ATCA_HEALTH_TEST_ERROR: u8 = 0xFA;
 pub(crate) const ATCA_ALLOC_FAILURE: u8 = 0xFB;
 pub(crate) const ATCA_WATCHDOG_ABOUT_TO_EXPIRE: u8 = 0xEE;
 
+pub(crate) const ATCA_MISC_ERROR : u8 = 0x80;
+
 /// Struct to hold command `Status Errors`
 #[derive(Copy, Clone, Debug)]
-pub struct StatusError(pub u8, pub ATCA_ERRORS);
+pub struct StatusError(pub u8);
 pub(crate) enum DECODE_ERROR {}
 
 impl DECODE_ERROR {
     pub fn get_error(value: u8) -> StatusError {
         match value {
-            0x00 => StatusError (ATCA_SUCCESS, ATCA_ERRORS::NoError("StatusSuccess")),
-            0x01 => StatusError (ATCA_CHECKMAC_VERIFY_FAILED, ATCA_ERRORS::CheckmacVerifyFailedError("response status byte indicates CheckMac/Verify failure, (status byte = 0x01)")),
-            0x03 => StatusError (ATCA_PARSE_ERROR, ATCA_ERRORS::ParseError("response status byte indicates parsing, error(status byte = 0x03)")),
-            0x05 => StatusError (ATCA_STATUS_ECC, ATCA_ERRORS::EccFaultError("response status byte is ECC fault (status byte = 0x05)")),
-            0x07 => StatusError (ATCA_STATUS_SELFTEST_ERROR, ATCA_ERRORS::SelfTestError("response status byte is Self Test Error, chip in failure mode (status byte = 0x07)")),
-            0x08 => StatusError (ATCA_HEALTH_TEST_ERROR, ATCA_ERRORS::HealthTestError("random number generator health test error")),
-            0x0F => StatusError (ATCA_EXECUTION_ERROR, ATCA_ERRORS::ExecutionError("chip was in a state where it could not execute the command, response, status byte indicates command execution error (status byte = 0x0F)")),
-            0x11 => StatusError (ATCA_WAKE_SUCCESS, ATCA_ERRORS::NoError("WakeSuccess")),
-            0xEE => StatusError (ATCA_WATCHDOG_ABOUT_TO_EXPIRE, ATCA_ERRORS::WatchDogAboutToExpireError("response status indicates insufficient time to execute the given commmand before watchdog timer expires (status byte = 0xEE)")),
-            0xFF => StatusError (ATCA_STATUS_CRC, ATCA_ERRORS::CrcError("incorrect CRC received")),
-            _    => StatusError (ATCA_UNIMPLEMENTED, ATCA_ERRORS::UnimplementedError),
+            0x00 => StatusError (ATCA_SUCCESS),
+            0x01 => StatusError (ATCA_CHECKMAC_VERIFY_FAILED),
+            0x03 => StatusError (ATCA_PARSE_ERROR),
+            0x05 => StatusError (ATCA_STATUS_ECC),
+            0x07 => StatusError (ATCA_STATUS_SELFTEST_ERROR),
+            0x08 => StatusError (ATCA_HEALTH_TEST_ERROR),
+            0x0F => StatusError (ATCA_EXECUTION_ERROR),
+            0x11 => StatusError (ATCA_WAKE_SUCCESS),
+            0xEE => StatusError (ATCA_WATCHDOG_ABOUT_TO_EXPIRE),
+            0xFF => StatusError (ATCA_STATUS_CRC),
+            0x80 => StatusError (ATCA_MISC_ERROR),
+            _    => StatusError (ATCA_UNIMPLEMENTED),
         }
     }
 }
