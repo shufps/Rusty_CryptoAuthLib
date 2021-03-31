@@ -17,7 +17,6 @@ pub mod constants;
 pub mod macros;
 pub mod packet;
 
-#[macro_use(block)]
 extern crate nb;
 extern crate embedded_hal;
 // extern crate panic_halt;
@@ -47,7 +46,6 @@ macro_rules! error {
 use core::ops::Deref;
 use embedded_hal::blocking::delay::{DelayMs, DelayUs};
 use embedded_hal::blocking::i2c::{Read, Write};
-use embedded_hal::timer::CountDown;
 use heapless::{consts::*, Vec};
 use postcard::to_vec;
 
@@ -68,30 +66,26 @@ enum Variant {
 
 /// ATECC680A driver
 #[derive(Copy, Clone, Debug, PartialEq)]
-pub struct ATECC608A<I2C, DELAY, TIMER> {
+pub struct ATECC608A<I2C, DELAY> {
     /// i2c Instance
     pub i2c: I2C,
     /// delay timer instance
     pub delay: DELAY,
-    /// time instance
-    pub timer: TIMER,
     /// device address
     pub dev_addr: u8,
     device: Variant,
 }
 
-impl<I2C, DELAY, TIMER, E> ATECC608A<I2C, DELAY, TIMER>
+impl<I2C, DELAY, E> ATECC608A<I2C, DELAY>
 where
     I2C: Read<Error = E> + Write<Error = E>,
     DELAY: DelayMs<u32> + DelayUs<u32>,
-    TIMER: CountDown<Time = u32>,
 {
     /// Creates a new ATECC608a driver.
-    pub fn new(i2c: I2C, delay: DELAY, timer: TIMER) -> Result<Self, E> {
+    pub fn new(i2c: I2C, delay: DELAY) -> Result<Self, E> {
         let atecc608a = ATECC608A {
             i2c,
             delay,
-            timer,
             dev_addr: ADDRESS,
             device: DEVICE_TYPE,
         };
@@ -179,15 +173,14 @@ where
         self.i2c.write(self.dev_addr, &pkt[..(pkt[1] + 1) as usize])
             .map_err(|_| constants::StatusError(constants::ATCA_MISC_ERROR))?;
 
-        let t_exec: constants::Time = (EXECUTION_TIME::ATECC608A(texec.clone()))
+        let t_exec: usize = (EXECUTION_TIME::ATECC608A(texec.clone()))
             .get_value()
             .get_t_exec();
+            
 
         // wait tEXEC (max) after which the device will have completed execution, and the
         // result can be read from the device using a normal read sequence.
-        self.timer.start(t_exec.0 as u32 * 1000);
-        block!(self.timer.wait())
-            .map_err(|_| constants::StatusError(constants::ATCA_MISC_ERROR))?;
+        self.delay.delay_us(t_exec as u32 * 1000);
 
         // The first byte holds the length of the response.
         let mut count_byte = [0; 1];
